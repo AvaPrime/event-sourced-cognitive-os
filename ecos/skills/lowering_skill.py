@@ -1,11 +1,8 @@
 """
 LoweringSkill — Minimal deterministic compiler-domain skill for E-COS v0.1
 
-This skill does NOT perform heavy compilation.
-It emits a deterministic sequence of events that *represent* the lowering process.
-
-This proves that real domain work (Codessa-style compiler construction)
-can be expressed purely as event emission inside the E-COS kernel.
+Emits a deterministic sequence of events representing AST lowering.
+Now satisfies the minimal EventContract requirements and attaches intent.
 """
 
 from __future__ import annotations
@@ -17,10 +14,8 @@ from ..core.primitives import Event, EventType, Node
 
 class LoweringSkill:
     """
-    Deterministic Skill that turns a COMPILER_TASK_STARTED into
-    a sequence of IR construction events.
-
-    Constraint: same input Node + Event → identical emitted events.
+    Deterministic Skill.
+    All emitted events now carry required payload keys + intent for explainability.
     """
     name = "LoweringSkill"
     description = "Emits deterministic IR lowering event trace for compiler tasks"
@@ -35,29 +30,25 @@ class LoweringSkill:
         triggering_event: Event,
         context: Dict[str, Any]
     ) -> List[Event]:
-        """
-        Pure emission of lowering events.
-        In later versions this will call into Codessa's stricter reducer.
-        """
         task_id = triggering_event.payload.get("task_id", "unknown")
         source = triggering_event.payload.get("source", "")
 
         emitted: List[Event] = []
 
-        # 1. Announce IR root node creation
+        # IR root
         emitted.append(Event(
             type=EventType.IR_NODE_CREATED,
             payload={
                 "task_id": task_id,
                 "node_type": "Module",
-                "name": "root",
-                "source_ref": source[:64] if source else None
+                "name": "root"
             },
             causality_id=triggering_event.id,
-            branch_id=triggering_event.branch_id
+            branch_id=triggering_event.branch_id,
+            intent="create_ir_root_node"
         ))
 
-        # 2. Emit a few deterministic lowering steps (simulating passes)
+        # Lowering steps with intent
         steps = ["parse", "resolve", "lower_to_ir"]
         for i, step in enumerate(steps):
             emitted.append(Event(
@@ -65,35 +56,35 @@ class LoweringSkill:
                 payload={
                     "task_id": task_id,
                     "step": step,
-                    "step_index": i,
-                    "deterministic": True
+                    "step_index": i
                 },
                 causality_id=triggering_event.id,
-                branch_id=triggering_event.branch_id
+                branch_id=triggering_event.branch_id,
+                intent=f"lowering_step_{step}"
             ))
 
-        # 3. Finalize
+        # Finalize
         emitted.append(Event(
             type=EventType.IR_FINALIZED,
             payload={
                 "task_id": task_id,
-                "final_node_count": 1 + len(steps),
-                "status": "ok"
+                "final_node_count": 1 + len(steps)
             },
             causality_id=triggering_event.id,
-            branch_id=triggering_event.branch_id
+            branch_id=triggering_event.branch_id,
+            intent="finalize_ir"
         ))
 
-        # 4. Task complete
+        # Task complete
         emitted.append(Event(
             type=EventType.COMPILER_TASK_COMPLETED,
             payload={
                 "task_id": task_id,
-                "result": "lowering_complete",
-                "events_emitted": len(emitted)
+                "result": "lowering_complete"
             },
             causality_id=triggering_event.id,
-            branch_id=triggering_event.branch_id
+            branch_id=triggering_event.branch_id,
+            intent="complete_compiler_task"
         ))
 
         return emitted
