@@ -11,7 +11,7 @@ import os
 import tempfile
 
 from ecos.core.primitives import (
-    Event, EventType, EventLog, SemanticViolationError, EventContractRegistry
+    Event, EventType, EventLog, SemanticViolationError
 )
 
 
@@ -29,7 +29,7 @@ def test_missing_task_id():
     with tempfile.TemporaryDirectory() as tmp:
         log = EventLog(persist_path=os.path.join(tmp, "events.jsonl"))
         bad = Event(type=EventType.COMPILER_TASK_STARTED, payload={})  # missing task_id
-        log.append(bad)  # should raise
+        log.append(bad)
 
 
 def test_missing_node_type():
@@ -53,18 +53,19 @@ def test_missing_step():
 
 
 def test_missing_intent():
-    # Temporarily strengthen one contract for this test
+    # Force require_intent on one contract for this test only
+    from ecos.core.primitives import EventContractRegistry
     registry = EventContractRegistry()
     contract = registry.get(EventType.COMPILER_TASK_STARTED)
     if contract:
-        object.__setattr__(contract, "require_intent", True)  # force intent requirement
+        object.__setattr__(contract, "require_intent", True)
 
     with tempfile.TemporaryDirectory() as tmp:
         log = EventLog(persist_path=os.path.join(tmp, "events.jsonl"))
         bad = Event(
             type=EventType.COMPILER_TASK_STARTED,
             payload={"task_id": "t1"},
-            intent=None  # violates require_intent
+            intent=None
         )
         log.append(bad)
 
@@ -72,14 +73,13 @@ def test_missing_intent():
 def test_unknown_event_allowed():
     with tempfile.TemporaryDirectory() as tmp:
         log = EventLog(persist_path=os.path.join(tmp, "events.jsonl"))
+        # Use SYSTEM (has no contract) to prove unknown/uncontracted events are allowed
         unknown = Event(
-            type="unknown_event_x",  # type coercion will fail in Enum, but we test via raw
-            payload={}
+            type=EventType.SYSTEM,
+            payload={"note": "no contract defined, should pass"}
         )
-        # This should be allowed because no contract exists
-        # We simulate by using a non-enum type that bypasses strict check
-        # For real test we just confirm unknown EventType values are tolerated
-        log.append(unknown)  # if it reaches here without contract error, it's allowed
+        log.append(unknown)  # should succeed
+        assert len(log) == 1
 
 
 def test_valid_event_success():
@@ -101,18 +101,18 @@ def main():
     print("VIOLATION OBSERVATION HARNESS — Semantic Gate Stress Test")
     print("=" * 70)
 
-    print("\n[Adversarial Cases]")
+    print("\n[Adversarial Cases - Must be rejected]")
     run_case("Missing task_id on COMPILER_TASK_STARTED", test_missing_task_id)
     run_case("Missing node_type on IR_NODE_CREATED", test_missing_node_type)
     run_case("Missing step on LOWERING_STEP", test_missing_step)
     run_case("Missing intent when required", test_missing_intent)
 
     print("\n[Extensibility & Positive Control]")
-    run_case("Unknown event type is allowed (no contract)", test_unknown_event_allowed)
+    run_case("Unknown/uncontracted event type is allowed", test_unknown_event_allowed)
     run_case("Valid well-formed event is accepted + reduced", test_valid_event_success)
 
     print("\n" + "=" * 70)
-    print("Harness complete. All rejections contained. No leakage observed.")
+    print("Harness complete. Jurisdiction layer contains failure. No leakage.")
     print("=" * 70)
 
 
