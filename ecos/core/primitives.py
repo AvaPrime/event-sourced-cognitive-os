@@ -35,6 +35,13 @@ class EventType(str, Enum):
     UI_INTERACTION = "ui_interaction"
     SYSTEM = "system"
 
+    # Compiler-domain events (Codessa workload) - v0.1
+    COMPILER_TASK_STARTED = "compiler_task_started"
+    IR_NODE_CREATED = "ir_node_created"
+    LOWERING_STEP = "lowering_step"
+    IR_FINALIZED = "ir_finalized"
+    COMPILER_TASK_COMPLETED = "compiler_task_completed"
+
 
 @dataclass(frozen=True)
 class Event:
@@ -95,27 +102,64 @@ class EventLog:
     """
     Append-only event store. Single source of truth for a cognitive session.
     Supports branching via branch_id tagging.
-    In production this would be backed by a durable log (e.g. Kafka, SQLite, or custom).
+
+    v0.1 persistence: simple append-only events.jsonl (no DB, no schema rigidity).
     """
 
-    def __init__(self, session_id: Optional[str] = None):
+    def __init__(self, session_id: Optional[str] = None, persist_path: Optional[str] = None):
         self.session_id = session_id or str(uuid.uuid4())
+        self.persist_path = persist_path
         self._events: List[Event] = []
-        self._nodes_cache: Dict[str, Node] = {}  # branch_id -> latest materialized node (optional)
+        self._nodes_cache: Dict[str, Node] = {}
+
+        if self.persist_path:
+            self._load_from_jsonl()
+
+    def _load_from_jsonl(self):
+        """Load events from append-only jsonl file if it exists."""
+        import os
+        if not os.path.exists(self.persist_path):
+            return
+        with open(self.persist_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                # Reconstruct Event (handle timestamp)
+                ts = datetime.fromisoformat(data["timestamp"])
+                ev = Event(
+                    type=EventType(data["type"]),
+                    payload=data["payload"],
+                    id=data["id"],
+                    timestamp=ts,
+                    causality_id=data.get("causality_id"),
+                    branch_id=data.get("branch_id", "main"),
+                    metadata=data.get("metadata", {})
+                )
+                self._events.append(ev)
+
+    def _append_to_jsonl(self, event: Event):
+        """Append a single event to the jsonl file immediately."""
+        if not self.persist_path:
+            return
+        with open(self.persist_path, "a", encoding="utf-8") as f:
+            f.write(event.to_json() + "\n")
 
     def append(self, event: Event) -> Event:
         """Append is the only mutating operation. Everything else is derived."""
         if not isinstance(event, Event):
             raise TypeError("Only Event instances may be appended")
         self._events.append(event)
-        # Invalidate cache for this branch (simple strategy)
+        if self.persist_path:
+            self._append_to_jsonl(event)
         if event.branch_id in self._nodes_cache:
             del self._nodes_cache[event.branch_id]
         return event
 
     @property
     def events(self) -> List[Event]:
-        return list(self._events)  # defensive copy
+        return list(self._events)
 
     def get_events(
         self,
@@ -124,7 +168,6 @@ class EventLog:
         until: Optional[datetime] = None,
         event_types: Optional[List[EventType]] = None
     ) -> List[Event]:
-        """Query events for a specific branch (supports time travel & filtering)."""
         result = [e for e in self._events if e.branch_id == branch_id]
         if since:
             result = [e for e in result if e.timestamp >= since]
@@ -139,15 +182,10 @@ class EventLog:
         branch_id: str = "main",
         up_to: Optional[datetime] = None
     ) -> Node:
-        """
-        P2 in action: Reconstruct state by folding events.
-        This is the deterministic reducer: State(T) = reduce(EventStream[0..T])
-        """
         events = self.get_events(branch_id=branch_id, until=up_to)
         if not events:
             return Node(branch_id=branch_id, state={"status": "empty"})
 
-        # --- Deterministic reduction rules (extensible) ---
         state: Dict[str, Any] = {
             "messages": [],
             "last_agent_decision": None,
@@ -155,8 +193,8 @@ class EventLog:
             "tool_results": {},
             "branch_history": [],
             "event_count": 0,
+            "compiler_tasks": [],
         }
-
         event_ids: List[str] = []
         last_ts = events[0].timestamp
 
@@ -171,7 +209,6 @@ class EventLog:
                     "content": ev.payload.get("content", ""),
                     "event_id": ev.id
                 })
-
             elif ev.type == EventType.AGENT_DECISION:
                 state["last_agent_decision"] = ev.payload
                 state["messages"].append({
@@ -179,33 +216,37 @@ class EventLog:
                     "content": ev.payload.get("reasoning", ""),
                     "event_id": ev.id
                 })
-
             elif ev.type == EventType.SKILL_RESULT:
                 state["active_skills"].append(ev.payload.get("skill_name"))
-
             elif ev.type == EventType.TOOL_RESULT:
                 tool_name = ev.payload.get("tool_name")
                 if tool_name:
                     state["tool_results"][tool_name] = ev.payload.get("result")
-
             elif ev.type == EventType.BRANCH_FORK:
                 state["branch_history"].append({
                     "forked_from": ev.payload.get("parent_branch"),
                     "new_branch": ev.branch_id,
                     "at_event": ev.id
                 })
-
             elif ev.type == EventType.STATE_TRANSITION:
-                # Allow skills/agents to explicitly patch state
                 patch = ev.payload.get("state_patch", {})
                 state.update(patch)
+            elif ev.type == EventType.COMPILER_TASK_STARTED:
+                state["compiler_tasks"].append({
+                    "task_id": ev.payload.get("task_id"),
+                    "status": "started"
+                })
+            elif ev.type in (EventType.IR_FINALIZED, EventType.COMPILER_TASK_COMPLETED):
+                # Simple tracking for compiler workload
+                if state["compiler_tasks"]:
+                    state["compiler_tasks"][-1]["status"] = "completed"
 
         node = Node(
             branch_id=branch_id,
             timestamp=last_ts,
             state=state,
             event_ids=event_ids,
-            metadata={"reducer_version": "0.1"}
+            metadata={"reducer_version": "0.1-jsonl"}
         )
         self._nodes_cache[branch_id] = node
         return node
@@ -216,11 +257,6 @@ class EventLog:
         new_branch_id: Optional[str] = None,
         fork_event_payload: Optional[Dict] = None
     ) -> str:
-        """
-        Create a new branch that shares history prefix with parent.
-        Returns the new branch_id.
-        This is how "chat branching" becomes first-class execution forking.
-        """
         new_branch = new_branch_id or f"branch_{uuid.uuid4().hex[:8]}"
         fork_event = Event(
             type=EventType.BRANCH_FORK,
@@ -229,7 +265,7 @@ class EventLog:
                 "new_branch": new_branch,
                 **(fork_event_payload or {})
             },
-            branch_id=new_branch,   # The fork event lives on the new branch
+            branch_id=new_branch,
             causality_id=self._events[-1].id if self._events else None
         )
         self.append(fork_event)
@@ -239,82 +275,35 @@ class EventLog:
         return len(self._events)
 
     def __repr__(self) -> str:
-        return f"EventLog(session={self.session_id[:8]}, events={len(self)})"
+        return f"EventLog(session={self.session_id[:8]}, events={len(self)}, persist={bool(self.persist_path)})"
 
 
 # ============================================================
-# P4 + P5 + P6 + P7 Protocols / Interfaces (for implementation)
+# P4 + P5 + P6 + P7 Protocols / Interfaces
 # ============================================================
 
 class Skill(Protocol):
-    """
-    P5 — Executable Cognition Unit.
-    A deterministic behavioral program compiled into state transition rules.
-    Not a function. A small state machine over events.
-    """
     name: str
     description: str
     version: str
 
-    def matches(self, event: Event, node: Node) -> bool:
-        """Does this skill activate on the current event + state?"""
-        ...
-
-    def execute(
-        self,
-        current_node: Node,
-        triggering_event: Event,
-        context: Dict[str, Any]
-    ) -> List[Event]:
-        """
-        Pure(ish) transition function.
-        Returns new events to be appended (may include skill_result, state_transition, tool_call, etc.)
-        Must be deterministic given same inputs.
-        """
-        ...
+    def matches(self, event: Event, node: Node) -> bool: ...
+    def execute(self, current_node: Node, triggering_event: Event, context: Dict[str, Any]) -> List[Event]: ...
 
 
 class MCPBridge(Protocol):
-    """
-    P6 — Model Context Protocol capability bridge.
-    Pure syscall / tool interface. Owns ZERO reasoning or persistent state.
-    Agents and Skills use this to discover and invoke external capabilities.
-    """
-    def list_tools(self) -> List[Dict[str, Any]]:
-        ...
-
-    def invoke_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """Structured, validated tool call. Returns structured result."""
-        ...
-
-    def register_tool(self, name: str, schema: Dict, handler: Callable) -> None:
-        ...
+    def list_tools(self) -> List[Dict[str, Any]]: ...
+    def invoke_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any: ...
+    def register_tool(self, name: str, schema: Dict, handler: Callable) -> None: ...
 
 
 class Agent(Protocol):
-    """
-    P4 — Execution Kernel / Scheduler.
-    Not a chatbot. An active process that:
-    - observes events
-    - selects & runs matching Skills
-    - resolves conflicts across branches
-    - emits new events (including forking)
-    """
     name: str
     skills: List[Skill]
     mcp: MCPBridge
 
-    def process_new_event(
-        self,
-        event_log: EventLog,
-        event: Event
-    ) -> List[Event]:
-        """Main loop entry. Returns any newly emitted events."""
-        ...
-
-    def decide_next_action(self, node: Node) -> Optional[Event]:
-        """Optional: high-level planner that can emit agent_decision events."""
-        ...
+    def process_new_event(self, event_log: EventLog, event: Event) -> List[Event]: ...
+    def decide_next_action(self, node: Node) -> Optional[Event]: ...
 
 
 def project(
@@ -323,11 +312,6 @@ def project(
     branch_id: str = "main",
     **kwargs
 ) -> Dict[str, Any]:
-    """
-    P7 — Pure projection / rendering function.
-    UI is never logic. It is a view over the event graph.
-    Examples: chat, graphviz, timeline, debug replay, branch diff.
-    """
     node = event_log.reduce_to_node(branch_id=branch_id)
 
     if view_type == "chat":
@@ -338,9 +322,7 @@ def project(
             "last_decision": node.state.get("last_agent_decision"),
             "event_count": node.state.get("event_count", 0)
         }
-
     elif view_type == "graph":
-        # Placeholder for graph projection (nodes + edges)
         return {
             "type": "graph",
             "branch_id": branch_id,
@@ -348,7 +330,6 @@ def project(
             "latest_node": node.summary(),
             "events": [e.to_dict() for e in event_log.get_events(branch_id=branch_id)]
         }
-
     elif view_type == "timeline":
         events = event_log.get_events(branch_id=branch_id)
         return {
@@ -358,27 +339,17 @@ def project(
                 for e in events
             ]
         }
-
     else:
         return {"type": view_type, "error": "unknown view"}
 
 
-# ============================================================
-# Utility: Determinism helper
-# ============================================================
-
 def assert_deterministic_replay(log: EventLog, branch_id: str = "main") -> bool:
-    """
-    Verification primitive: replaying the same events must produce identical node state.
-    Critical for auditability and time-travel debugging.
-    """
     node1 = log.reduce_to_node(branch_id=branch_id)
-    # Simulate fresh log replay (in real impl we'd rebuild from persisted events)
     node2 = log.reduce_to_node(branch_id=branch_id)
     return node1.state == node2.state and node1.event_ids == node2.event_ids
 
 
 if __name__ == "__main__":
     print("E-COS Primitives v0.1 loaded successfully.")
-    print("Core classes: Event, Node, Edge, EventLog, Skill (Protocol), MCPBridge (Protocol), Agent (Protocol)")
-    print("Key operations: append, reduce_to_node, fork_branch, project")
+    print("Core classes: Event, Node, Edge, EventLog (with jsonl persistence), Skill, MCPBridge, Agent")
+    print("New in v0.1: COMPILER_* events + jsonl persistence")
